@@ -1,0 +1,105 @@
+#!/usr/bin/python
+"""Read-only check of the configured USB filesystem, with a five-second deadline."""
+import fcntl, json, mmap, os, re, select, signal, stat, sys, uuid
+
+MOUNT = '/srv/usg-files'
+UUID_FILE = '/config/usg-services/storage.uuid'
+
+class Unhealthy(Exception):
+    pass
+
+def probe():
+    result = {'status': 'error', 'hdd': {'connected': None, 'mounted': False, 'readable': False}}
+    try:
+        expected = uuid.UUID(open(UUID_FILE).read().strip())
+        rows = [line.split() for line in open('/proc/mounts')]
+        matches = [r for r in rows if r[1] == MOUNT]
+        if len(matches) != 1:
+            raise Unhealthy('disk_not_mounted')
+        dev, target, fs, opts = matches[0][:4]
+        if not re.match(r'^/dev/sd[a-z]+[0-9]+$', dev) or fs != 'ext3':
+            raise Unhealthy('unexpected_filesystem')
+        name = os.path.basename(dev)
+        path = '/sys/class/block/' + name
+        if not os.path.exists(path) or '/usb' not in os.path.realpath(path):
+            result['hdd']['connected'] = False
+            raise Unhealthy('usb_disk_missing')
+        disk = re.sub(r'[0-9]+$', '', name)
+        if open('/sys/class/block/' + disk + '/device/state').read().strip() != 'running':
+            raise Unhealthy('usb_disk_not_running')
+        if int(open(path + '/size').read()) <= 0:
+            raise Unhealthy('usb_disk_empty')
+        result['hdd']['connected'] = True
+        device = os.stat(dev)
+        if not stat.S_ISBLK(device.st_mode) or os.stat(MOUNT).st_dev != device.st_rdev:
+            raise Unhealthy('mount_device_mismatch')
+        result['hdd']['mounted'] = True
+        if 'rw' not in opts.split(','):
+            raise Unhealthy('filesystem_read_only')
+        # Direct I/O bypasses the page cache, so a cached file cannot hide a lost disk.
+        fd = os.open(dev, os.O_RDONLY | os.O_DIRECT)
+        with os.fdopen(fd, 'rb', 0) as stream:
+            buf = mmap.mmap(-1, 4096)
+            try:
+                if stream.readinto(buf) != 4096:
+                    raise Unhealthy('short_disk_read')
+                if buf[1080:1082] != '\x53\xef':
+                    raise Unhealthy('filesystem_signature_mismatch')
+                if uuid.UUID(bytes=buf[1128:1144]) != expected:
+                    raise Unhealthy('wrong_disk_uuid')
+            finally:
+                buf.close()
+        usage = os.statvfs(MOUNT)
+        result['hdd']['readable'] = True
+        result['hdd']['free_bytes'] = usage.f_bavail * usage.f_frsize
+        result['status'] = 'ok'
+    except Unhealthy as e:
+        result['reason'] = str(e)
+    except Exception:
+        result['reason'] = 'disk_check_failed'
+    return result
+
+def check():
+    lock = os.open('/var/run/usg-storage-health.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        os.close(lock)
+        return {'status': 'error', 'reason': 'disk_check_busy'}
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        # A stuck disk worker must not keep the CGI output pipe open.
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        if null > 2:
+            os.close(null)
+        try:
+            os.write(write_fd, json.dumps(probe()))
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], 5.0)
+        if not ready:
+            os.kill(pid, signal.SIGKILL)
+            return {'status': 'error', 'reason': 'disk_check_timeout'}
+        data = os.read(read_fd, 4096)
+        return json.loads(data) if data else {'status': 'error', 'reason': 'disk_check_failed'}
+    finally:
+        os.close(read_fd)
+        os.close(lock)
+        # Never block on a disk task stuck in uninterruptible kernel I/O.
+        os.waitpid(pid, os.WNOHANG)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 1:
+        sys.exit(2)
+    try:
+        result = check()
+    except Exception:
+        result = {'status': 'error', 'reason': 'disk_check_failed'}
+    print(json.dumps(result))
+    sys.exit(0 if result['status'] == 'ok' else 1)

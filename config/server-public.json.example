@@ -1,0 +1,19 @@
+{
+  "name": "USG Services",
+  "interface": "wg0",
+  "egress_interface": "br0",
+  "address": "192.0.2.1",
+  "client_subnet": "192.0.2.0/24",
+  "dns": "192.0.2.1",
+  "listen_port": 51820,
+  "mtu": 1420,
+  "endpoint": "",
+  "public_key": "",
+  "allowed_ips": [
+    "192.0.2.0/24"
+  ],
+  "nat": false,
+  "api_scope": "LAN/VPN only",
+  "storage_path": "/srv/usg-files",
+  "storage_protocol": "SFTP"
+}

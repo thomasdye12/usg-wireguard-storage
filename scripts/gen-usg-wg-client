@@ -1,0 +1,47 @@
+#!/bin/vbash
+export vyatta_sbindir=/opt/vyatta/sbin
+export vyatta_bindir=/opt/vyatta/bin
+set -e
+[ "$#" -eq 0 ] || exit 2
+umask 077
+exec 9>/config/usg-services/state/provision.lock
+flock -w 30 9 || exit 1
+workdir=$(mktemp -d /config/usg-services/state/client.XXXXXX)
+trap 'rm -rf "$workdir"' EXIT
+client_ip=$(/usr/bin/python - <<'PY'
+import re, subprocess
+s = open('/config/config.boot').read()
+s += subprocess.check_output(['sudo', '-n', '/usr/bin/wg', 'show', 'wg0', 'allowed-ips'])
+server = __import__('json').load(open('/config/usg-services/server-public.json'))
+subnet = server['client_subnet']
+m = re.match(r'^(\d+)\.(\d+)\.(\d+)\.0/24$', subnet)
+if not m or any(int(v) > 255 for v in m.groups()):
+    raise SystemExit('Configure an IPv4 /24 client subnet')
+prefix = '.'.join(m.groups()) + '.'
+used = set(int(n) for n in re.findall(re.escape(prefix) + r'(\d+)', s))
+used.add(int(server['address'].split('.')[-1]))
+for n in range(1, 255):
+    if n not in used:
+        print(prefix + str(n))
+        break
+else:
+    raise SystemExit('Client subnet is full')
+PY
+)
+wg genkey > "$workdir/private"
+public_key=$(wg pubkey < "$workdir/private")
+source /opt/vyatta/etc/functions/script-template
+configure >&2
+export COMMIT_SESSION_ID=$PPID
+export UBNT_CFGD_PROC_REQ_SID=$PPID
+set interfaces wireguard wg0 peer "$public_key" allowed-ips "$client_ip/32" >&2
+commit >&2
+save >&2
+configure_exit >&2
+/usr/bin/python - "$workdir/private" "$client_ip" <<'PY'
+import json, sys
+server = json.load(open('/config/usg-services/server-public.json'))
+print(json.dumps({'client': {'PrivateKey': open(sys.argv[1]).read().strip(),
+    'Address': sys.argv[2], 'Subnet': '24'}, 'server': server,
+    'setup_pending': not bool(server.get('endpoint'))}))
+PY

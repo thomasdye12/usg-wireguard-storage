@@ -1,0 +1,14 @@
+*.key
+*.pem
+*.crt
+*.token
+*.uuid
+*.deb
+*.zip
+*.log
+config.boot
+server-public.json
+clients.json
+.env*
+.DS_Store
+__pycache__/

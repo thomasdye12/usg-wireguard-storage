@@ -1,0 +1,3 @@
+www-data ALL=(root) NOPASSWD: /config/scripts/usg-wg-dump "", /config/scripts/usg-usb-status ""
+www-data ALL=(ubnt) NOPASSWD: /bin/vbash /config/scripts/gen-usg-wg-client
+www-data ALL=(root) NOPASSWD: /config/scripts/usg-storage-health ""
